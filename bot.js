@@ -1,5 +1,3 @@
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-
 require('dotenv').config();
 
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
@@ -34,36 +32,26 @@ const dbConfig = {
 
 const dbClient = new Client(dbConfig);
 
+const logger = pino({ level: process.env.LOG_LEVEL || 'error' });
+
 async function isUserBlocked(userId) {
   const result = await dbClient.query('SELECT is_blocked FROM users WHERE user_id = $1', [userId]);
   return result.rows.length > 0 && result.rows[0].is_blocked;
 }
 
-async function getAllGroupParticipants(groupId) {
-  try {
-    const groupMetadata = await sock.groupMetadata(groupId);
-    return groupMetadata?.participants?.map(p => p.id) || [];
-  } catch (error) {
-    console.error('Erro ao obter participantes do grupo:', error);
-    return [];
-  }
-}
-
-
 // Função para conectar ao banco de dados e testar a tabela 'users'
 async function connectDB() {
   try {
-    if (dbClient._connected) {
-      console.log('⚠️ Conexão com o banco já está ativa.');
-      return;
-    }
+    if (dbClient._connecting || dbClient._ending) return;
+    if (!dbClient._connected) await dbClient.connect();
+    dbClient._connected = true;
 
-    await dbClient.connect();
+
     console.log('✅ Conectado ao banco de dados PostgreSQL');
 
     // Testa se a tabela 'users' pode ser acessada
-    const res = await dbClient.query('SELECT user_id FROM users LIMIT 1');
-    console.log('📦 Teste de leitura da tabela users bem-sucedido:', res.rows.length, 'registro(s) encontrados.');
+    await dbClient.query('SELECT 1 FROM users LIMIT 1');
+    console.log('📦 Tabela users OK');
   } catch (err) {
     console.error('❌ Erro ao conectar ou ler a tabela users:', err.message || err);
   }
@@ -78,7 +66,7 @@ async function connectToWhatsApp() {
 
   const sock = makeWASocket({
     version,
-    logger: pino({ level: 'silent' }),
+    logger,           // reutiliza
     auth: state,
   });
 
@@ -114,8 +102,6 @@ async function connectToWhatsApp() {
         '';
       const isPrivate = jid.endsWith('@s.whatsapp.net');
       const senderJid = msg.key.participant || jid;
-      const senderNumber = senderJid.split('@')[0];
-
 
       // --- FUNÇÕES AUXILIARES (declaradas dentro do escopo para acesso a sock, dbClient, etc.) ---
 
@@ -312,7 +298,8 @@ async function connectToWhatsApp() {
               const participants = await getAllGroupParticipants(jid);
 
               // filtra todos menos o próprio bot
-              const mentions = participants.filter(id => id !== sock.user.id);
+              const botId = sock.user.id;
+              const mentions = participants.filter(id => id !== botId);
 
               // 🔑 se o próprio id do bot aparecer por bug, tira mesmo assim
               const botIds = [sock.user.id];
@@ -350,10 +337,15 @@ async function connectToWhatsApp() {
                 break;
               }
 
-              const buffer = await downloadMediaMessage(mediaMessage, 'buffer', {}, {
-                logger: pino({ level: 'silent' }),
-                reuploadRequest: sock.updateMediaMessage,
-              });
+                const buffer = await downloadMediaMessage(
+                  mediaMessage,
+                  'buffer',
+                  {},
+                  {
+                    logger,                 // reutiliza o mesmo logger
+                    reuploadRequest: sock.updateMediaMessage,
+                  }
+                );
 
               const webpBuffer = await sharp(buffer)
                 .resize(512, 512, {
